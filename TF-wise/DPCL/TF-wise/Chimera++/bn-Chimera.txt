@@ -1,0 +1,162 @@
+import tensorflow as tf
+from tensorflow.python.keras import backend as k
+from scipy.signal.spectral import spectrogram
+
+tf.enable_eager_execution()
+eps = 1e-8
+
+
+class Ptanh(tf.keras.Model):
+    def __init__(self):
+        super(Ptanh, self).__init__()
+        self.scale = tf.Variable(tf.ones([1]), trainable=True)
+        self.slope = tf.Variable(tf.ones([1]), trainable=True)
+
+    def call(self, inputs, training=None, mask=None):
+        return tf.nn.tanh(self.slope*inputs)*self.scale
+
+
+class GlobalLayerNorm(tf.keras.Model):
+    def __init__(self, channel_size):
+
+        super(GlobalLayerNorm, self).__init__()
+        self.gamma = tf.Variable(tf.ones([1, 1, 1, channel_size]), trainable=True)
+        self.beta = tf.Variable(tf.zeros([1, 1, 1, channel_size]), trainable=True)
+
+    def call(self, inputs, training=None, mask=None):
+        mean = k.mean(inputs, axis=[1, 2, 3], keepdims=True)
+        var = k.mean((inputs - mean)**2, axis=[1, 2, 3], keepdims=True)
+        return self.gamma * (inputs - mean) / tf.sqrt(var + eps) + self.beta
+
+
+class ConvBnRelu(tf.keras.Model):
+    def __init__(self, filters, stride, activation=tf.nn.elu, bn=True):
+        super(ConvBnRelu, self).__init__()
+        self.conv = tf.keras.layers.Conv2D(filters=filters, kernel_size=3, strides=(1, stride), use_bias=False,
+                                           padding="valid")
+        self.bn = bn
+        if bn:
+            self.bn_ = GlobalLayerNorm(filters)
+        self.pad = tf.keras.layers.ZeroPadding2D((1, 0))
+        self.activation = activation
+
+    def call(self, inputs, training=None, mask=None):
+        inputs = self.pad(inputs)
+        inputs = self.conv(inputs)
+        if self.bn:
+            inputs = self.bn_(inputs)
+        inputs = self.activation(inputs)
+        return inputs
+
+
+class ConvBnReluinv(tf.keras.Model):
+    def __init__(self, filters, stride, activation=tf.nn.elu, bn=True):
+        super(ConvBnReluinv, self).__init__()
+        self.conv = tf.keras.layers.Conv2DTranspose(filters=filters, kernel_size=3, strides=(1, stride), use_bias=False,
+                                                    padding="valid")
+        self.bn = bn
+        if bn:
+            # self.bn_ = GlobalLayerNorm(filters)
+            self.bn_ = tf.keras.layers.BatchNormalization(momentum=.9)
+        self.pad = tf.keras.layers.Cropping2D((1, 0))
+        self.activation = activation
+
+    def call(self, inputs, training=None, mask=None):
+        inputs = self.pad(inputs)
+        inputs = self.conv(inputs)
+        if self.bn:
+            inputs = self.bn_(inputs, training)
+        inputs = self.activation(inputs)
+        return inputs
+
+
+class NonLocalblock(tf.keras.Model):
+    def __init__(self, rep_layers=512, output_filters=512):
+        super(NonLocalblock, self).__init__()
+        self.rep = rep_layers
+        self.outputfilter = output_filters
+        self.conv1 = tf.keras.layers.Conv2D(filters=rep_layers,
+                                            kernel_size=1, strides=1, padding="valid")
+        self.conv2 = tf.keras.layers.Conv2D(filters=rep_layers,
+                                            kernel_size=1, strides=1, padding="valid")
+        self.conv3 = tf.keras.layers.Conv2D(filters=output_filters,
+                                            kernel_size=1, strides=1, padding="valid")
+        # self.gln = GlobalLayerNorm(output_filters)
+        self.bn = tf.keras.layers.BatchNormalization(momentum=.9)
+
+    def call(self, inputs, training=None, mask=None):
+        bs, time, freq, chs = inputs.shape
+        query = self.conv1(inputs)
+        key = self.conv2(inputs)
+        value = self.conv3(inputs)
+        query = tf.reshape(query, [bs, -1, self.rep])
+        key = tf.reshape(key, [bs, -1, self.rep])
+        value = tf.reshape(value, [bs, -1, self.outputfilter])
+        scale_dot = tf.einsum("bjk, btk->bjt", query, key)
+        scale_dot = tf.nn.softmax(scale_dot, axis=-1)
+        value = tf.einsum("bjt, btk->bjk", scale_dot, value)
+        value = tf.reshape(value, [bs, time, freq, self.outputfilter])
+        # value = self.gln(value)
+        value = self.bn(value, training)
+        return value + inputs
+
+
+class BackBone(tf.keras.Model):
+    def __init__(self):
+        super(BackBone, self).__init__()
+        self.ptanh = Ptanh()
+        self.conv1 = ConvBnRelu(filters=16, stride=1)
+        self.conv2 = ConvBnRelu(filters=16, stride=2)
+        self.conv3 = ConvBnRelu(filters=32, stride=2)
+        self.conv4 = ConvBnRelu(filters=64, stride=2)
+        self.conv5 = ConvBnRelu(filters=128, stride=2)
+        self.conv6 = ConvBnRelu(filters=256, stride=2)
+        self.conv7 = ConvBnRelu(filters=512, stride=2)
+        self.non = NonLocalblock()
+        self.convinv1 = ConvBnReluinv(filters=512, stride=2)
+        self.convinv2 = ConvBnReluinv(filters=256, stride=2)
+        self.convinv3 = ConvBnReluinv(filters=128, stride=2)
+        self.convinv4 = ConvBnReluinv(filters=64, stride=2)
+        self.convinv5 = ConvBnReluinv(filters=32, stride=2)
+        self.convinv6 = ConvBnReluinv(filters=16, stride=2)
+        self.convinv7 = ConvBnReluinv(filters=4, stride=1, bn=False, activation=tf.keras.activations.linear)
+
+    def call(self, inputs, training=None, mask=None):
+        x1 = self.conv1(inputs, training)
+        x2 = self.conv2(x1, training)
+        x3 = self.conv3(x2, training)
+        x4 = self.conv4(x3, training)
+        x5 = self.conv5(x4, training)
+        x6 = self.conv6(x5, training)
+        x7 = self.conv7(x6, training)
+
+        seqfeature = self.non(x7, training)
+
+        x7 = tf.concat([x7, seqfeature], axis=-1)
+        x8 = self.convinv1(x7, training)
+
+        x8 = tf.concat([x6, x8], axis=-1)
+        x9 = self.convinv2(x8, training)
+
+        x9 = tf.concat([x5, x9], axis=-1)
+        x10 = self.convinv3(x9, training)
+
+        x10 = tf.concat([x4, x10], axis=-1)
+        x11 = self.convinv4(x10, training)
+
+        x11 = tf.concat([x3, x11], axis=-1)
+        x12 = self.convinv5(x11, training)
+
+        x12 = tf.concat([x2, x12], axis=-1)
+        x13 = self.convinv6(x12, training)
+
+        x13 = tf.concat([x1, x13], axis=-1)
+        x14 = self.convinv7(x13, training)
+        return self.ptanh(x14)
+
+
+if __name__ == '__main__':
+    tf.enable_eager_execution()
+    a = BackBone()
+    b = a(tf.ones([64, 128, 129, 6]), True)
+    a.summary()

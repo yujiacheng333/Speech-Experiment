@@ -1,0 +1,157 @@
+
+import os
+import numpy as np
+import tensorflow as tf
+from aux_func import pad_audios
+from scipy.io import wavfile
+from Dataloaders import SourceSeparationSet
+from BackBoneModel.CNN_DPCL import BackBone
+from BackBoneModel.lossfunction import cal_loss
+from tensorflow.python.keras import backend as k
+
+
+tf.enable_eager_execution()
+
+
+class ModelAccess(object):
+    def __init__(self, action, TIMIT_dir, ckpt_dir):
+        super(ModelAccess, self).__init__()
+        assert action in ["train", "test", "import"], "Not in action set"
+        record_loader = SourceSeparationSet.Sepdataset(source_folder=TIMIT_dir)
+        self.train_dataset = record_loader.traindataset
+        self.eval_dataset = record_loader.evaldataset
+        self.test_dataset = record_loader.testdataset
+        self.audio_length = 16384
+        self.num_mixture_spk = 2
+        self.epochs = 160
+        self.lr = tf.Variable(0.)
+        self.max_lr = 1e-2
+        self.min_lr = 1e-4
+        self.batch_size = 16
+        self.warm_up_step = 500
+        self.decay_step = 100
+        self.decay_rate = 0.98
+        self.ckpt_dir = ckpt_dir
+        os.makedirs(self.ckpt_dir, exist_ok=True)
+        self.max_to_keep = 5
+        self.num_spks = int(record_loader.M - record_loader.T0)
+        self.B = BackBone()
+        self.current_step = tf.Variable(0)
+        self.current_epoch = tf.Variable(0)
+        self.optimizer = tf.train.AdamOptimizer(5e-4)
+        self.checkpoint = tf.train.Checkpoint(epoch=self.current_epoch,
+                                              step=self.current_step,
+                                              optimizer=self.optimizer,
+                                              model=self.B)
+        self.ckpt_manager = tf.train.CheckpointManager(self.checkpoint, self.ckpt_dir, max_to_keep=self.max_to_keep)
+        if self.ckpt_manager.latest_checkpoint:
+            print("Restored from {}".format(self.ckpt_manager.latest_checkpoint))
+        else:
+            print("Initializing from scratch.")
+        self.checkpoint.restore(self.ckpt_manager.latest_checkpoint)
+
+        if action == "train":
+
+            while self.current_epoch.numpy() < self.epochs:
+                self.work_on_dataset(self.train_dataset, training=True)
+                self.ckpt_manager.save()
+                self.work_on_dataset(self.eval_dataset, training=False)
+                self.current_epoch.assign_add(1)
+            self.work_on_dataset(self.test_dataset, training=False)
+        else:
+            print("finish load model!")
+
+    def work_on_dataset(self, dataset, training):
+        loss_list = []
+        if training:
+            dataset = dataset.shuffle(5040, reshuffle_each_iteration=True)
+        else:
+            dataset = dataset.shuffle(6300-5040, reshuffle_each_iteration=True)
+        dataset = dataset.padded_batch(self.batch_size,
+                                       padded_shapes=(tf.TensorShape([57344]),
+                                                      tf.TensorShape([]),
+                                                      tf.TensorShape([])),
+                                       drop_remainder=True)
+        local_iter1 = dataset.make_one_shot_iterator()
+        local_iter2 = dataset.make_one_shot_iterator()
+
+        for batch_data in zip(local_iter1, local_iter2):
+
+            speech_0, spk_0, length_0 = batch_data[0]
+            speech_1, spk_1, length_1 = batch_data[1]
+            speech_0, spk_0, length_0, speech_1, spk_1, length_1 = speech_0.numpy(), spk_0.numpy(), length_0.numpy(),\
+                                                                   speech_1.numpy(), spk_1.numpy(), length_1.numpy()
+            reptimes = np.sum(spk_0==spk_1)
+            if reptimes > self.batch_size / 2:
+                continue
+            for i in range(10):
+                reshuffle_index = np.random.choice(np.arange(self.batch_size), replace=False, size=self.batch_size)
+                spk_1 = spk_1[reshuffle_index]
+                reptimes = np.sum(spk_0 == spk_1)
+                if reptimes == 0:
+                    speech_1 = speech_1[reshuffle_index]
+                    length_1 = length_1[reshuffle_index]
+            speechs = np.concatenate([speech_0, speech_1], axis=0)
+            lengths = np.concatenate([length_0, length_1], axis=0)
+            pad_list = []
+            speech_list = []
+            for local_speech, local_length in zip(speechs, lengths):
+                s, p = pad_audios(local_speech, org_length=local_length, audio_length=self.audio_length)
+                pad_list.append(p)
+                speech_list.append(s)
+            speech_list = tf.cast(speech_list, tf.float32)
+            mean, var = tf.nn.moments(speech_list, axes=[1], keep_dims=True)
+            speech_list -= mean
+            speech_list /= tf.sqrt(var)
+            speech_list = speech_list.numpy()
+            speech_0, speech_1 = np.split(speech_list, 2, axis=0)
+            pad_list = np.stack(np.split(np.asarray(pad_list), 2, axis=0))
+            pad_list = np.max(pad_list, axis=0)
+            snr_tape = np.random.uniform(low=-3, high=3, size=[self.batch_size])
+            snr_tape = 10**(snr_tape/10.)
+            speech_1 *= snr_tape[:, np.newaxis]
+            mixture = speech_0 + speech_1
+            mixture_stft = tf.signal.stft(mixture, frame_length=256, frame_step=128, fft_length=256, pad_end=True)[..., tf.newaxis]
+            angle = np.angle(mixture_stft)
+            amp = np.abs(mixture_stft)
+            amp /= k.max(amp, axis=[1, 2], keepdims=True)
+            mixture_stft = np.concatenate([np.cos(angle)*amp, np.sin(angle)*amp], axis=-1)
+            with tf.GradientTape() as tape:
+                output_cirm = self.B(mixture_stft, True)
+                output_cirm = tf.stack(tf.split(output_cirm, 2, axis=-1))
+                recoon_stft = mixture_stft[tf.newaxis] * output_cirm
+                rec_list = []
+                for i in range(2):
+                    local_stft = tf.cast(recoon_stft[i], tf.complex64)
+                    local_stft = local_stft[..., 0] + 1j*local_stft[..., 1]
+                    rec_list.append(tf.signal.inverse_stft(local_stft, frame_length=256, frame_step=128, fft_length=256))
+                rec_list = tf.cast(rec_list, tf.float32)[..., :16384]
+                rec_list = tf.transpose(rec_list, [1, 0, 2])
+                pure_speech = tf.concat([speech_0[:, np.newaxis], speech_1[:, np.newaxis]], axis=1)
+                loss = cal_loss(pure_speech, rec_list, pad_list)
+                if training:
+                    grd = tape.gradient(loss, self.B.trainable_variables)
+                    self.optimizer.apply_gradients(zip(grd, self.B.trainable_variables))
+                else:
+                    loss_list.append(loss)
+        if not training:
+            wavfile.write("./sampleoutput/mixture.wav", 8000, mixture[0])
+            wavfile.write("./sampleoutput/puer0.wav", 8000, speech_0[0])
+            wavfile.write("./sampleoutput/puer1.wav", 8000, speech_1[0])
+            wavfile.write("./sampleoutput/recon_0.wav", 8000, rec_list[0, 0].numpy()/np.max(np.abs(rec_list[0, 0].numpy())))
+            wavfile.write("./sampleoutput/recon_1.wav", 8000, rec_list[0, 1].numpy()/np.max(np.abs(rec_list[0, 1].numpy())))
+            print("After {} epo training, the mean sisnr is {:3f}".format(self.current_epoch.numpy(), -np.mean(loss_list)))
+
+
+    def warm_up_dacay_lr(self):
+        if self.current_step < self.warm_up_step:
+            lr = self.current_step.numpy() / self.warm_up_step * (self.max_lr - self.min_lr) + self.min_lr
+        else:
+            lr = self.max_lr * self.decay_rate ** ((self.current_step.numpy() - self.warm_up_step) / self.decay_step)
+        self.lr.assign(lr)
+
+
+if __name__ == '__main__':
+    ModelAccess("train", TIMIT_dir="/home/guest/Desktop/Ada_EA_S/TIMIT_data",
+                ckpt_dir="/home/guest/Desktop/Ada_EA_S/Ckpts/BackBone")
+
