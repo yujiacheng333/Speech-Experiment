@@ -1,0 +1,63 @@
+import tensorflow as tf
+from tensorflow.python.keras import backend as k
+eps = 1e-8
+
+
+class GLN(tf.keras.Model):
+    def __init__(self):
+        super(GLN, self).__init__()
+        self.ndim = None
+        self.gamma = None
+        self.beta = None
+
+    def build(self, input_shape):
+        chs = input_shape[-1]
+        self.gamma = self.add_variable(name="gamma",
+                                       shape=[1, 1, chs],
+                                       initializer=tf.keras.initializers.Ones(),
+                                       trainable=True)
+        self.beta = self.add_variable(name="beta",
+                                      shape=[1, 1, chs],
+                                      initializer=tf.keras.initializers.Zeros(),
+                                      trainable=True)
+
+    def call(self, inputs, training=None, mask=None):
+        mean, var = tf.nn.moments(inputs, keep_dims=True, axes=[1, 2])
+        inputs = (inputs - mean) / k.sqrt(var + eps) * self.gamma + self.beta
+        return inputs
+
+
+class resBiLSTM(tf.keras.Model):
+    def __init__(self, hidden_channels):
+        super(resBiLSTM, self).__init__()
+        self.model = tf.keras.Sequential([tf.keras.layers.Bidirectional(tf.keras.layers.CuDNNGRU(units=hidden_channels,
+                                                                                                 return_sequences=True)),
+                                          tf.keras.layers.Conv1D(filters=hidden_channels, kernel_size=1),
+                                          GLN()])
+
+    def call(self, inputs, training=None, mask=None):
+        return self.model(inputs) + inputs
+
+
+class DPCLnet(tf.keras.Model):
+    def __init__(self, hidden=512):
+        super(DPCLnet, self).__init__()
+        self.conv_expand = tf.keras.layers.Conv1D(filters=hidden, kernel_size=1, use_bias=True)
+        self.rnn_list = tf.keras.Sequential([])
+        for i in range(4):
+            self.rnn_list.add(resBiLSTM(hidden_channels=hidden))
+        self.rnn_list.add(tf.keras.layers.Conv1D(filters=129*40, kernel_size=1, use_bias=False))
+
+    def call(self, inputs, training=None, mask=None):
+        inputs = self.conv_expand(inputs)
+        inputs = self.rnn_list(inputs)
+        inputs = tf.reshape(inputs, [-1, 247, 129, 40])
+        return tf.nn.l2_normalize(inputs, axis=-1)
+
+
+if __name__ == '__main__':
+    tf.enable_eager_execution()
+    test_input = tf.ones([64, 247, 129])
+    mod = DPCLnet()
+    test_input = mod(test_input)
+    mod.summary()
