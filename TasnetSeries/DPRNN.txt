@@ -1,0 +1,283 @@
+import tensorflow as tf
+import numpy as np
+from tensorflow.python.keras import backend as k
+eps = 1e-6
+
+
+class GLN(tf.keras.Model):
+    def __init__(self):
+        super(GLN, self).__init__()
+        self.ndim = None
+        self.gamma = None
+        self.beta = None
+
+    def build(self, input_shape):
+        chs = input_shape[-1]
+        self.ndim = len(input_shape)
+        if self.ndim == 4:
+
+            self.gamma = self.add_variable(name="gamma",
+                                           shape=[1, 1, 1, chs],
+                                           initializer=tf.keras.initializers.Ones(),
+                                           trainable=True)
+            self.beta = self.add_variable(name="beta",
+                                          shape=[1, 1, 1, chs],
+                                          initializer=tf.keras.initializers.Zeros(),
+                                          trainable=True)
+        if self.ndim == 3:
+            self.gamma = self.add_variable(name="gamma",
+                                           shape=[1, 1, chs],
+                                           initializer=tf.keras.initializers.Ones(),
+                                           trainable=True)
+            self.beta = self.add_variable(name="beta",
+                                          shape=[1, 1, chs],
+                                          initializer=tf.keras.initializers.Zeros(),
+                                          trainable=True)
+
+    def call(self, inputs, training=None, mask=None):
+        if self.ndim == 4:
+            target_axis = [1, 2, 3]
+        if self.ndim == 3:
+            target_axis = [1, 2]
+        mean, var = tf.nn.moments(inputs, keep_dims=True, axes=target_axis)
+        inputs = (inputs - mean) / k.sqrt(var + eps) * self.gamma + self.beta
+        return inputs
+
+
+class ChannelWiseLayerNorm(tf.keras.Model):
+    def __init__(self):
+        super(ChannelWiseLayerNorm, self).__init__()
+        self.ndim = None
+        self.gamma = None
+        self.beta = None
+
+    def build(self, input_shape):
+        chs = input_shape[-1]
+        self.ndim = len(input_shape)
+        if self.ndim == 4:
+            self.gamma = self.add_variable(name="gamma",
+                                           shape=[1, 1, 1, chs],
+                                           initializer=tf.keras.initializers.Ones(),
+                                           trainable=True)
+            self.beta = self.add_variable(name="beta",
+                                          shape=[1, 1, 1, chs],
+                                          initializer=tf.keras.initializers.Zeros(),
+                                          trainable=True)
+        if self.ndim == 3:
+            self.gamma = self.add_variable(name="gamma",
+                                           shape=[1, 1, chs],
+                                           initializer=tf.keras.initializers.Ones(),
+                                           trainable=True)
+            self.beta = self.add_variable(name="beta",
+                                          shape=[1, 1, chs],
+                                          initializer=tf.keras.initializers.Zeros(),
+                                          trainable=True)
+
+    def call(self, inputs, training=None, mask=None):
+        mean, var = tf.nn.moments(inputs, keep_dims=True, axes=-1)
+        inputs = (inputs - mean) / k.sqrt(var + eps) * self.gamma + self.beta
+        return inputs
+
+
+class Encoder(tf.keras.Model):
+    def __init__(self, kernel_size, out_channels=256):
+        super(Encoder, self).__init__()
+        self.conv = tf.keras.layers.Conv1D(kernel_size=kernel_size, filters=out_channels, use_bias=False,
+                                           strides=kernel_size//2, padding="same")
+
+    def call(self, inputs, training=None, mask=None):
+        """
+        input_shape = [Bs, samplepts, chs~1 or not]
+        """
+        inputs = tf.nn.relu(self.conv(inputs))
+        return inputs
+
+
+class Decoder(tf.keras.Model):
+    def __init__(self, kernel_size=2, num_speakers=1):
+        super(Decoder, self).__init__()
+        self.conv = tf.keras.layers.Conv2DTranspose(kernel_size=(kernel_size, 1), filters=num_speakers, use_bias=False,
+                                                    strides=(kernel_size//2, 1), padding="same")
+
+    def call(self, inputs, training=None, mask=None):
+        """
+        input_shape = [Bs, samplepts//stride, channels]
+        output_shape = [Bs, samplepts, spk]
+        """
+        inputs = inputs[:, :, tf.newaxis, :]
+        inputs = tf.nn.tanh(self.conv(inputs))
+        return tf.squeeze(inputs)
+
+
+def segmentation(x, k):
+    """
+    就是说填充了一个步长P之后，整个数据能够被划分为多少帧，如果还有多的，再填一帧
+    双向填充，使得重叠相加更简单原始的这个填充大小不知道啥情况。。。应该只需要一个%
+    :param x:[Bs, Lenght, rep_filters]
+    :param k: frame_lenght, p:frame step
+    :return: [Bs, N, K, chs] N = ((L + K//2) / k).upper * 2
+    """
+    bs, length, chs = x.get_shape().as_list()
+    p = k // 2
+    gap = k - (p + length) % k
+
+    x = tf.pad(x, ((0, 0), (0+p, gap+p), (0, 0)))
+    x_leading = x[:, :-p, :]
+    x_leading = tf.reshape(x_leading, [bs, -1, k, chs])
+    x_lagging = x[:, p:, :]
+    x_lagging = tf.reshape(x_lagging, [bs, -1, k, chs])
+    concate = tf.concat([x_leading, x_lagging], axis=-2)
+    concate = tf.reshape(concate, [bs, -1, k, chs])
+    return concate, gap
+
+
+def over_add(x, gap):
+    """
+
+    :param x: [Bs, N, K, chs]
+    :param gap: pad_length not include frame pad
+    :return: seq_feature [Bs, samplepts, chs]
+    """
+    Bs, N, K, chs = x.get_shape().as_list()
+    P = K//2
+    x = tf.reshape(x, [Bs, -1, K*2, chs])
+    x = tf.split(x, 2, axis=2)
+    x_leadding = x[0]
+    x_lagging = x[1]
+    x_leadding = tf.reshape(x_leadding, [Bs, -1, chs])
+    x_leadding = x_leadding[:, P:, :]
+    x_lagging = tf.reshape(x_lagging, [Bs, -1, chs])
+    x_lagging = x_lagging[:, :-P, :]
+    recon = (x_leadding + x_lagging)[:, :-gap, :]
+    return recon / 2.
+
+
+class DPRNNblock(tf.keras.Model):
+    def __init__(self,
+                 feature_channels,
+                 hidden_channels):
+        super(DPRNNblock, self).__init__()
+        self.intra_rnn = tf.keras.layers.Bidirectional(
+            tf.keras.layers.CuDNNLSTM(units=hidden_channels, return_sequences=True))
+        self.inter_rnn = tf.keras.layers.Bidirectional(
+            tf.keras.layers.CuDNNLSTM(units=hidden_channels, return_sequences=True))
+        self.intra_norm = GLN()
+        self.inter_norm = GLN()
+        self.intra_linear = tf.keras.layers.Conv1D(filters=feature_channels, kernel_size=1, use_bias=False)
+        self.inter_linear = tf.keras.layers.Conv1D(filters=feature_channels, kernel_size=1, use_bias=False)
+
+    def call(self, inputs, training=None, mask=None):
+        """
+        input_shape = [Bs, N, K, chs]
+        eq shape mapping
+        """
+        output = inputs
+        Bs, N, K, chs = inputs.get_shape().as_list()
+        inputs = tf.reshape(inputs, [Bs*N, K, chs])
+        inputs = self.intra_rnn(inputs)
+        inputs = self.intra_linear(inputs)
+        inputs = tf.reshape(inputs, [Bs, N, K, chs])
+        inputs = self.intra_norm(inputs)
+        output += inputs
+
+        inputs = tf.reshape(tf.transpose(output, [0, 2, 1, 3]), [Bs*K, N, chs])
+        inputs = self.inter_rnn(inputs)
+        inputs = self.inter_linear(inputs)
+        inputs = self.inter_norm(inputs)
+        inputs = tf.transpose(tf.reshape(inputs, [Bs, K, N, chs]), [0, 2, 1, 3])
+        output += inputs
+        return output
+
+
+class Auxgateoutput(tf.keras.Model):
+    """
+    Aux gate output for DPRNN
+    https://github.com/ShiZiqiang/dual-path-RNNs-DPRNNs-based-speech-separation/blob/master/models.py
+    """
+    def __init__(self, input_channels, target_channels):
+        super(Auxgateoutput, self).__init__()
+        self.out = tf.keras.layers.Conv1D(input_channels, kernel_size=1)
+        self.gate = tf.keras.layers.Conv1D(input_channels, kernel_size=1)
+        self.maskconv1x1 = tf.keras.layers.Conv1D(target_channels, kernel_size=1, use_bias=False)
+
+    def call(self, inputs, training=None, mask=None):
+        gateoutput = tf.nn.tanh(self.out(inputs)) * tf.nn.sigmoid(self.gate(inputs))
+        return self.maskconv1x1(gateoutput)
+
+
+class DPRNN(tf.keras.Model):
+    """
+    basic_model of DPRNN
+    """
+    def __init__(self, feature_channels, hidden_channels,
+                 num_layers=6, K=200, num_spks=2):
+        super(DPRNN, self).__init__()
+        self.spk = num_spks
+        self.K = K
+        self.norm = GLN()
+        self.conv1d = tf.keras.layers.Conv1D(filters=feature_channels, kernel_size=1, use_bias=False)
+        self.dual_rnn = tf.keras.Sequential([])
+        for i in range(num_layers):
+            self.dual_rnn.add(DPRNNblock(hidden_channels=hidden_channels, feature_channels=feature_channels))
+        self.prelu = tf.keras.layers.PReLU()
+        self.spk_channelexpand = tf.keras.layers.Conv1D(filters=num_spks*feature_channels,
+                                                        kernel_size=1)
+
+    def call(self, inputs, training=None, mask=None):
+        inputs = self.norm(inputs)
+        inputs = self.conv1d(inputs)
+        inputs, gap = segmentation(inputs, self.K)
+        # [Bs, N, K, chs]
+        inputs = self.dual_rnn(inputs)
+        inputs = over_add(inputs, gap)
+        inputs = self.prelu(inputs)
+        inputs = self.spk_channelexpand(inputs)
+        inputs = tf.concat(tf.split(inputs, self.spk, axis=-1), axis=0)
+        return inputs
+
+
+class Model(tf.keras.Model):
+    def __init__(self,
+                 enc_channels,
+                 feature_channels,
+                 hidden_channels,
+                 kernel_size=2,
+                 num_layers=6,
+                 K=200,
+                 num_spks=2):
+        super(Model, self).__init__()
+        self.spk = num_spks
+        self.enc = Encoder(kernel_size=kernel_size, out_channels=enc_channels)
+        self.dec = Decoder(kernel_size=kernel_size, num_speakers=1)
+        self.sepration = DPRNN(feature_channels,
+                               hidden_channels,
+                               num_layers,
+                               K,
+                               num_spks)
+
+        self.compressgate = Auxgateoutput(input_channels=feature_channels, target_channels=enc_channels)
+
+    def call(self, inputs, training=None, mask=None):
+        e = self.enc(inputs)
+        s = self.sepration(e)
+        s = self.compressgate(s)
+        # s = tf.nn.relu(s)
+        s = tf.split(s, self.spk, axis=0)
+        s = tf.cast(s, tf.float32)
+        s = tf.nn.softmax(s, axis=0)
+        separator = e[tf.newaxis] * s
+        spk, bs, L, Chs = separator.get_shape().as_list()
+        separator = tf.reshape(separator, [spk*bs, L, Chs])
+        audios = self.dec(separator)
+        audios = tf.reshape(audios, [spk, bs, -1])
+        return tf.transpose(audios, [1, 0, 2])
+
+
+if __name__ == '__main__':
+    tf.enable_eager_execution()
+    test_inputs = np.random.normal(size=[1, 100, 1])
+    test_inputs = tf.cast(test_inputs, tf.float32)
+    Model_basic = Model(enc_channels=256, feature_channels=64, hidden_channels=128, K=200)
+    data = Model_basic(test_inputs)
+    print(data.shape)
+    Model_basic.summary()
