@@ -1,200 +1,136 @@
-
-from tensorflow.python.keras import backend as k
-import librosa
 import tensorflow as tf
 import numpy as np
-import pyroomacoustics as pra
-tf.enable_eager_execution()
-eps = 1e-8
+from tensorflow.python.keras import backend as k
 
-def trim_silence(audio, rate=.1):
-    audio = tf.signal.frame(audio, frame_length=512, frame_step=512)
-    power = np.std(audio, axis=1)
-    threhold = np.mean(power) * rate
-    amp_mask = power < threhold
-    right = 0
-    left = 0
-    for i in range(len(amp_mask)):
-        if amp_mask[i]:
-            right += 1
-        else:
-            break
+rerank_tabel = np.load("rerank.npy").astype(np.int64)-1
+reranktable = rerank_tabel.astype(np.float32)
 
-    for i in range(len(amp_mask)):
-        if amp_mask[-(i+1)]:
-            left += 1
-        else:
-            break
-    if left == 0:
-        audio = audio[right:]
+
+"""def cutoff_image_randomly(raw, samtic, w, h):
+    raw = raw[:w, :h]
+    samtic = samtic[:w, :h]
+    w, h, c = raw.shape
+    diff_w = w - 256
+    diff_h = h - 256
+    pad_size = []
+    if diff_w >= 0:
+        shift_w = np.random.randint(0, diff_w, dtype=int)
+        raw = raw[shift_w:shift_w + 256]
+        samtic = samtic[shift_w:shift_w + 256]
+        pad_size.append(0)
     else:
-        audio = audio[right:-left]
-    return tf.signal.overlap_and_add(audio, frame_step=512)
+        wpad = -diff_w
+        raw = np.pad(raw, ((0, wpad), (0, 0), (0, 0)))
+        samtic = np.pad(samtic, ((0, wpad), (0, 0)))
+        pad_size.append(wpad)
 
-
-def pad_audios(audio,  org_length, audio_length, right_pad=False):
-    audio = audio[:org_length]
-    org_length = org_length
-    if org_length > audio_length:
-        diff_l = org_length - audio_length
-        left = np.random.randint(0, diff_l)
-        right = diff_l - left
-        audio = audio[left:-right]
-        padding = [0, 0]
-    elif org_length < audio_length:
-        diff_l = np.abs(org_length - audio_length)
-        if right_pad:
-            left = 0
-        else:
-            left = np.random.randint(0, diff_l)
-        right = diff_l - left
-        audio = np.pad(array=audio, pad_width=(left, right))
-        padding = [left, right]
+    if diff_h >= 0:
+        shift_h = np.random.randint(0, diff_h, dtype=int)
+        raw = raw[:, shift_h:shift_h + 256]
+        samtic = samtic[:, shift_h:shift_h + 256]
+        pad_size.append(0)
     else:
-        padding = [0, 0]
-    return audio, padding
+        hpad = -diff_h
+        raw = np.pad(raw, ((0, 0), (0, hpad), (0, 0)))
+        samtic = np.pad(samtic, ((0, 0), (0, hpad)))
+        pad_size.append(hpad)
+    mask = np.zeros([256, 256])
+    mask[:256 - pad_size[0], :256 - pad_size[1]] = 1
+    return raw, samtic, mask"""
 
 
-
-def normalize(x):
-
-    x -= np.mean(x)
-    return x / np.max(np.abs(x))
-
-
-def whitting(x):
-    x = tf.cast(x, tf.float32)
-    mean, var = tf.nn.moments(x, keep_dims=True, axes=-1)
-    x = (x - mean) / k.sqrt(var + eps)
-    return x
-
-
-def create_mixture(x, snrs):
-    aerfas = 10**(snrs/10)
-    x = np.asarray(x)
-    x *= aerfas[:, np.newaxis]
-    return np.sum(x, axis=0)
+def FLloss(pred_map, cutted_samtic, masks):
+    cutted_samtic = tf.one_hot(tf.cast(cutted_samtic, tf.int64), depth=21, dtype=tf.float32)
+    masks = tf.cast(masks, tf.float32)
+    masks = tf.reshape(masks, [-1, 1])
+    pred_map = tf.reshape(pred_map, [-1, 21])
+    cutted_samtic = tf.reshape(cutted_samtic, [-1, 21])
+    """expterm = tf.exp(pred_map)
+    sum_term = k.sum(expterm, axis=-1, keepdims=True)"""
+    # FL = (1 - expterm / sum_term) ** 2 * (pred_map - tf.math.log(sum_term)) * cutted_samtic
+    FL = (1. - tf.nn.softmax(tf.stop_gradient(pred_map))) ** 2 * tf.nn.log_softmax(pred_map) * cutted_samtic
+    return - k.sum(FL * masks) / k.sum(masks)
 
 
-def mix_audios(audio_array,
-               paddings,
-               mixnum,
-               dataexpand_rate,
-               spk_num):
-    """
-
-    :param audio_array: [Total, time]
-    :param paddings: [Total]
-    :param  mix_num: Max source num
-    :param dataexpand_rate: not epoch expand
-    :return: [Total * dataexpand_rate , time * (maxmix_num + 1)], # mix data first
-            ,[Total * dataexpand_rate, max_mix_num]
-    """
-    total_mix_num = 10 * spk_num * dataexpand_rate
-    stepdata_list = []
-    padding_list = []
-    spker_list = []
-    for i in range(total_mix_num):
-        spk_index = np.random.choice(spk_num, mixnum, replace=False)
-        speech_index = np.random.randint(0, 10, size=mixnum)
-        local_fetch = []
-        local_padding = []
-        for j in range(mixnum):
-            local_fetch.append(audio_array[spk_index[j], speech_index[j], :])
-            local_padding.append(paddings[spk_index[j], speech_index[j]])
-        snr = np.zeros([mixnum])
-        snr[1:] = np.random.uniform(-3, 3, size=[mixnum-1])
-        mixture = create_mixture(local_fetch, snr)[np.newaxis]
-        local_fetch = np.asarray(local_fetch)
-        step_data = np.concatenate([mixture, local_fetch], axis=0)
-        stepdata_list.append(step_data)
-        padding_list.append(np.max(local_padding))
-        spker_list.append(spk_index) # delete "#" when need the speaker label
-    return np.asarray(stepdata_list).astype(np.float32), np.asarray(padding_list).astype(np.int16),\
-           np.asarray(spker_list).astype(np.int16),
+def embeddingLoss(embedding, cutted_samtic):
+    b, w, h, f = embedding.shape
+    embedding = tf.reshape(embedding, [b * w * h, f])
+    cutted_buffer = cutted_samtic
+    cutted_buffer = tf.reshape(cutted_buffer, [b * w * h, -1])
+    yyt1 = tf.matmul(cutted_buffer, tf.matmul(cutted_buffer,
+                                              np.ones([b * w * h, 1], dtype=np.float32), transpose_a=True))
+    yyt1 = 1. / tf.sqrt(yyt1)
+    yyt1 = tf.transpose(yyt1)[0, :, tf.newaxis]
+    vtv = tf.einsum("bf,bc->fc", embedding * yyt1, embedding)
+    yty = tf.einsum("bf,bc->fc", cutted_buffer * yyt1, cutted_buffer)
+    vty = tf.einsum("bf,bc->fc", embedding * yyt1, cutted_buffer)
+    loss_embedding = (k.sum(vtv ** 2) - 2 * k.sum(vty ** 2) + k.sum(yty ** 2)) / (w * h * f / 10.)
+    return loss_embedding
 
 
-
-tf.enable_eager_execution()
-
-
-def end_padding(signal, target_length):
-    gap = target_length - len(signal)
-    signal = np.pad(signal, (0, gap), mode="constant")
-    return signal, gap
-
-
-def makeroom(source, room_sz, absorption, normalize_macs):
-    num_source = len(source)
-    max_dist = min(room_sz[0], room_sz[1]) / 2.
-    room_center = room_sz / 2.
-    mac_hight = np.random.uniform(low=0.6, high=1)
-    normalize_macs[2, :] += mac_hight
-    normalize_macs[:2, :] += room_center[:2, np.newaxis]
-    rectfied_macs = pra.MicrophoneArray(normalize_macs, 8000)
-    room = pra.ShoeBox(room_sz, absorption=absorption, max_order=3, mics=rectfied_macs)
-    spk_dist = np.random.uniform(low=max_dist/2., high=max_dist, size=[num_source])
-    shift = np.random.uniform(0, np.pi*2)
-    spk_angle = np.random.choice(np.arange(0, np.pi*2, np.pi/3.), num_source) + shift
-    spk_x = np.cos(spk_angle) * spk_dist + room_center[0]
-    spk_y = np.sin(spk_angle) * spk_dist + room_center[1]
-    spk_z = np.random.uniform(1.5, 2.0, size=num_source)
-    for i in range(num_source):
-        room.add_source(position=[spk_x[i], spk_y[i], spk_z[i]], signal=source[i])
-    room.compute_rir()
-    snr = np.random.uniform(5, 15)
-    room.simulate(snr=snr)
-    recv_signals = room.mic_array.signals
-    recv_signals = recv_signals.astype(np.float32)
-
-    """
-    label_signal
-    """
-    label_signals = []
-    gaps = []
-    room_center[-1] = mac_hight
-    room_center = room_center[:, np.newaxis]
-    room_center_mac = pra.MicrophoneArray(room_center, 8000)
-    for i in range(num_source):
-        room = pra.ShoeBox(room_sz, absorption=1., max_order=0, mics=room_center_mac)
-        room.add_source(position=[spk_x[i], spk_y[i], spk_z[i]], signal=source[i])
-        room.compute_rir()
-        room.simulate()
-        pad_signal, gap = end_padding(room.mic_array.signals[0], target_length=recv_signals.shape[-1])
-        label_signals.append(pad_signal)
-        gaps.append(gap)
-    one_step_data= tf.concat([recv_signals, tf.cast(label_signals, tf.float32)], axis=0)
-    print(2)
-    return one_step_data, np.max(gaps)
+def Diceloss(pred_map, cutted_samtic):
+    pred_map = tf.nn.softmax(pred_map)
+    cutted_samtic = tf.one_hot(tf.cast(cutted_samtic, tf.int64), depth=21, dtype=tf.float32)
+    exsist_weight = tf.clip_by_value(k.sum(cutted_samtic, axis=[1, 2]), clip_value_min=0., clip_value_max=1.).numpy()
+    exsist_weight[np.sum(exsist_weight, axis=1) == 1] = 0.
+    inter = k.sum(pred_map * cutted_samtic, axis=[1, 2])
+    intra = k.sum(pred_map ** 2, axis=[1, 2]) + k.sum(cutted_samtic ** 2, axis=[1, 2])
+    loss = (1 - (2 * inter + 1) / (intra + 1)) * exsist_weight
+    weight = np.asarray([[1.74518097, 39.60527565, 39.0037343, 36.00139185, 43.58438583, 28.0961859,
+                         31.59653758, 23.9822721, 27.83823349, 33.18632839, 33.54881958, 37.16966452,
+                         38.40291471, 36.36421256, 36.85893006, 30.02681763, 29.44990249, 35.71968487,
+                         33.72870758, 31.0863762, 15.53419507]])
+    loss *= weight
+    return k.mean(loss)
 
 
-if __name__ == '__main__':
-    audios = []
-    for i in range(2):
-        audios.append(librosa.load("./0_{}.wav".format(i), sr=8000)[0])
-    w = np.random.uniform(low=12, high=13)
-    l = np.random.uniform(low=12, high=13)
-    h = np.random.uniform(low=3, high=4)
-    absorption = np.random.uniform(low=0.5, high=1)
-    normalize_macs = pra.beamforming.circular_2D_array(center=[0, 0],
-                                                       M=6,
-                                                       radius=.04,
-                                                       phi0=0)
-    center_mac = np.asarray([[0], [0]])
-    normalize_macs = np.concatenate([normalize_macs, center_mac], axis=1)
-    normalize_macs = np.concatenate([normalize_macs, np.zeros([1, 7])], axis=0)
-    recv_signals, label_signals, gaps = makeroom(audios, room_sz=np.asarray([w, l, h]), absorption=.9, normalize_macs=normalize_macs)
-    """plt.plot(recv_signals[-1])
-    plt.show()
-    plt.plot(np.sum(label_signals, axis=0))
-    plt.show()
-    print(np.sum(np.abs(recv_signals[-1] - np.sum(label_signals, axis=0))))
-    a = np.abs(tf.signal.stft(recv_signals[-1], frame_length=256, frame_step=128, fft_length=256))
-    plt.imshow(a)
-    plt.show()
-    b = np.abs(tf.signal.stft(np.sum(label_signals, axis=0).astype(np.float32), frame_length=256, frame_step=128, fft_length=256))
-    plt.imshow(b)
-    plt.show()"""
-    process_recv(recv_signals=recv_signals)
+def Softmaxloss(pred_map, cutted_samtic):
+    pred_map = tf.reshape(pred_map, [-1, 21])
+    cutted_samtic = tf.cast(cutted_samtic, tf.int64)
+    cutted_samtic = tf.reshape(cutted_samtic, [-1])
+    celoss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=pred_map, labels=cutted_samtic)
+    celoss = celoss
+    return k.mean(celoss)
 
 
+def IOUmetric(x, y, grd_mask):
+    y = tf.one_hot(tf.cast(y[..., 0], tf.int64), depth=21, dtype=tf.float32)
+    hasobj = k.sum(y, axis=[0, 1, 2]).numpy()
+    hasobj = (hasobj !=0)
+    x = tf.nn.softmax(x, axis=-1)
+    x *= grd_mask
+    y *= grd_mask
+    inter = np.sum(np.sum(np.logical_and(x, y), axis=1), axis=1)
+    union = np.sum(np.sum(np.logical_or(x, y), axis=1), axis=1)
+    inter = inter[:, hasobj]
+    union = union[:, hasobj]
+    iou = inter / union
+    return iou
+
+def bce(preds, trues, grd_mask, beta=1, channel_axis=-1):
+    preds = tf.nn.softmax(preds, axis=-1)
+    trues = tf.one_hot(tf.cast(trues[..., 0], tf.int64), depth=21, dtype=tf.float32)
+    loss = tf.keras.losses.BinaryCrossentropy(preds, trues)
+    print(1)
+
+
+def fb_loss(preds, trues, beta=1, channel_axis=-1):
+    preds = tf.nn.softmax(preds, axis=-1)
+    trues = tf.one_hot(tf.cast(trues, tf.int64), depth=21, dtype=tf.float32)
+    smooth = 1e-4
+    beta2 = beta * beta
+    batch = preds.shape[0]
+    classes = preds.shape[channel_axis]
+    preds = tf.reshape(preds, [batch, -1, classes])
+    trues = tf.reshape(trues, [batch, -1, classes])
+    weights = tf.clip_by_value(tf.reduce_sum(trues, axis=1), clip_value_min=0., clip_value_max=1.)
+    TP_raw = preds * trues
+    TP = tf.reduce_sum(TP_raw, axis=1)
+    FP_raw = preds * (1 - trues)
+    FP = tf.reduce_sum(FP_raw, axis=1)
+    FN_raw = (1 - preds) * trues
+    FN = tf.reduce_sum(FN_raw, axis=1)
+    Fb = ((1 + beta2) * TP + smooth) / ((1 + beta2) * TP + beta2 * FN + FP + smooth)
+    Fb = Fb * weights
+    score = tf.reduce_sum(Fb) / (tf.reduce_sum(weights) + smooth)
+    return 1. - tf.clip_by_value(score, 0., 1.)
