@@ -8,21 +8,21 @@ class Identityblock(tf.keras.Model):
     def __init__(self, filters, kernel_size, stride=1):
         super(Identityblock, self).__init__()
         self.chs = filters
-        self.conv1 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same")
         self.bn1 = tf.keras.layers.BatchNormalization()
         self.relu1 = tf.keras.layers.ReLU()
-        self.conv2 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same", strides=stride)
+        self.conv1 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same")
         self.bn2 = tf.keras.layers.BatchNormalization()
         self.relu2 = tf.keras.layers.ReLU()
+        self.conv2 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same", strides=stride)
 
     def call(self, inputs, training=None, mask=None):
         res = inputs
-        inputs = self.conv1(inputs)
         inputs = self.bn1(inputs, training)
         inputs = self.relu1(inputs)
-        inputs = self.conv2(inputs)
+        inputs = self.conv1(inputs)
         inputs = self.bn2(inputs, training)
         inputs = self.relu2(inputs)
+        inputs = self.conv2(inputs)
         return inputs + res
 
 
@@ -31,24 +31,28 @@ class StrideBlock(tf.keras.Model):
     def __init__(self, filters, kernel_size, stride=2):
         super(StrideBlock, self).__init__()
         self.chs = filters
-        self.conv1 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same")
+
         self.bn1 = tf.keras.layers.BatchNormalization()
         self.relu1 = tf.keras.layers.ReLU()
-        self.conv2 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same", strides=stride)
+        self.conv1 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same")
+
         self.bn2 = tf.keras.layers.BatchNormalization()
         self.relu2 = tf.keras.layers.ReLU()
-        self.skip = tf.keras.layers.Conv2D(filters=filters, kernel_size=1, strides=stride)
+        self.conv2 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same", strides=stride)
+
         self.bn3 = tf.keras.layers.BatchNormalization()
+        self.skip = tf.keras.layers.Conv2D(filters=filters, kernel_size=1, strides=stride)
 
     def call(self, inputs, training=None, mask=None):
-        res = self.bn3(self.skip(inputs), training=True)
-        inputs = self.conv1(inputs)
+        res = self.skip(self.bn3(inputs, training=True))
         inputs = self.bn1(inputs, training)
         inputs = self.relu1(inputs)
-        inputs = self.conv2(inputs)
+        inputs = self.conv1(inputs)
         inputs = self.bn2(inputs, training)
         inputs = self.relu2(inputs)
+        inputs = self.conv2(inputs)
         return inputs + res
+
 class ResNet34(tf.keras.Model):
     def __init__(self, category):
         super(ResNet34, self).__init__()
