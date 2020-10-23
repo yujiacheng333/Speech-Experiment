@@ -3,7 +3,13 @@ import tensorflow as tf
 from tensorflow.python.keras import backend as k
 eps = 1e-3
 
-
+## TODO: 4 better performence the ResNetV2 framework is adopted!!!!!!!!!!
+## TODO: If u want 2 utilize original 34， change the seq of 'bn relu conv' 2 'conv bn relu' !!!!! 
+##      #########
+##      ###   ###
+##       ~     ~
+##     |    V    |
+##       \ _W_ /
 class Identityblock(tf.keras.Model):
     def __init__(self, filters, kernel_size, stride=1):
         super(Identityblock, self).__init__()
