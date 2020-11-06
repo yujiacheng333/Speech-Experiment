@@ -66,7 +66,7 @@ class ResNet34(tf.keras.Model):
                                             kernel_size=(7, 7),
                                             strides=2,
                                             padding="same")
-        self.pool = tf.keras.layers.MaxPool2D()
+        self.stempool = tf.keras.layers.MaxPool2D()
         self.bneck1 = StrideBlock(filters=64, kernel_size=3, stride=1)
         self.bneck2 = Identityblock(filters=64, kernel_size=3)
         self.bneck3 = Identityblock(filters=64, kernel_size=3)
@@ -91,7 +91,7 @@ class ResNet34(tf.keras.Model):
 
     def call(self, inputs, training=None, mask=None):
         x = self.conv1(inputs)
-        x = self.pool(x)
+        x = self.stempool(x)
         x = self.bneck1(x, training=training)
         x = self.bneck2(x, training=training)
         x = self.bneck3(x, training=training)
