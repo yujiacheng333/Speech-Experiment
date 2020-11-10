@@ -1,5 +1,21 @@
-
 import tensorflow as tf
+
+class DenseConvUnit(tf.keras.Model):
+    def __init__(self, filters, kernel_size):
+        super(DenseConvUnit, self).__init__()
+        self.conv1x1 = tf.keras.layers.Conv2D(filters=filters, kernel_size=1, padding="same")
+        self.conv3x3 = tf.keras.layers.Conv2D(filters=filters, kernel_size=kernel_size, padding="same")
+        self.norm0 = tf.keras.layers.BatchNormalization()
+        self.norm1 = tf.keras.layers.BatchNormalization()
+
+    def call(self, inputs, training=None, mask=None):
+        inputs = tf.nn.relu(self.norm0(inputs, training))
+        inputs = self.conv1x1(inputs)
+        inputs = tf.nn.relu(self.norm1(inputs, training))
+        inputs = self.conv3x3(inputs)
+        return inputs
+
+
 class DenseBlock(tf.keras.Model):
     def __init__(self, k=32, stack_times=6):
         super(DenseBlock, self).__init__()
@@ -62,3 +78,22 @@ class DenseNetBackBone(tf.keras.Model):
             inputs = self.pool_list[i](inputs)
         inputs = self.block_list[-1](inputs)
         return inputs
+
+
+class DenseNet121(tf.keras.Model):
+    def __init__(self, category):
+        super(DenseNet121, self).__init__()
+        self.BackBone = DenseNetBackBone()
+        self.pool = tf.keras.layers.GlobalMaxPool2D()
+        self.decision = tf.keras.layers.Dense(units=category)
+
+    def call(self, inputs, training=None, mask=None):
+        embedding = self.pool(self.BackBone(inputs))
+        score = self.decision(embedding)
+        return score, embedding
+
+
+if __name__ == '__main__':
+    test_input = tf.ones([32, 224, 224, 3])
+    model = DenseNet121(category=1000)
+    model(test_input)
