@@ -1,5 +1,5 @@
 # Speech-Experiment
-Multi purpose speech experiment platform: speech separation, speech enhancement, speaker recognition - lab620 only!!
+Multi purpose speech experiment platform: speech separation, speech enhancement, speaker recognition
 TIMIT&MUSAN -free sound is adopted. The data mixing adopts completely random selection, which can potentially improve the robustness of the model.
 
 # Speech Separation:
