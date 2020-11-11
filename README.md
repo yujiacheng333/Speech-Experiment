@@ -7,7 +7,7 @@ Embedding 2 mask: DANET, DPCL is complete
 PIT: TasNet (R_latten), ConvTasNet, DPRNN, Chimira++
 
 # Speech Enhancememt
-similar to PIT
+similar to PIT， DarkConvTasNet
 
 # Classfier:
 ResNet18, 32, MobilenetV3, Nonuttrance classfier， ResNet34, DenseNet all version!!
