@@ -10,4 +10,4 @@ PIT: ConvTasNet, DPRNN, Chimira++
 similar to PIT
 
 # Classfier:
-ResNet18, 32, MobilenetV3, Nonuttrance classfier， ResNet34!!
+ResNet18, 32, MobilenetV3, Nonuttrance classfier， ResNet34, DenseNet all version!!
