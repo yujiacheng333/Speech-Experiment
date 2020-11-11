@@ -4,7 +4,7 @@ TIMIT&MUSAN -free sound is adopted. The data mixing adopts completely random sel
 
 # Speech Separation:
 Embedding 2 mask: DANET, DPCL is complete
-PIT: ConvTasNet, DPRNN, Chimira++
+PIT: TasNet (R_latten), ConvTasNet, DPRNN, Chimira++
 
 # Speech Enhancememt
 similar to PIT
